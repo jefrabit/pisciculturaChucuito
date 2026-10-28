@@ -54,17 +54,16 @@ const FOV = 55;
 // phi: ángulo polar (más alto = mira más bajo). 1.30 deja el horizonte
 // dentro del encuadre, lo que hace visible la franja de cielo con sol/luna.
 const camaraDefecto = { theta: 0.5, phi: 1.30, radio: 98 };
-const camara = { ...camaraDefecto, objetivo: [42, 1, 0] };
+const camara = { ...camaraDefecto, objetivo: [24, 1, 0] };
 const camera = new PerspectiveCamera(FOV, canvas.width / canvas.height, 0.1, 600);
 
 const VISTAS = {
-  general: { objetivo: [42, 1, 0], theta: 0.5, phi: 1.30, radio: 98 },
+  general: { objetivo: [24, 1, 0], theta: 0.5, phi: 1.30, radio: 98 },
   "estanque-1": { objetivo: [-25, 2, 0], theta: 0.95, phi: 0.8, radio: 26 },
   "estanque-2": { objetivo: [1, 0, 0], theta: 0.25, phi: 0.8, radio: 26 },
   "estanque-3": { objetivo: [27, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
   "estanque-4": { objetivo: [53, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
   "estanque-5": { objetivo: [79, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
-  "estanque-6": { objetivo: [107, 0, 0], theta: 0.15, phi: 0.7, radio: 32 },
   incubadora: { objetivo: [-10, 3, -16], theta: 0.15, phi: 0.9, radio: 20 }
 };
 
@@ -130,23 +129,21 @@ window.addEventListener("keydown", e => {
 // 3. LAYOUT DEL SITIO Y CONSTRUCCIÓN DE LA ESCENA
 // ------------------------------------------------------------
 // Invariantes del CIP Chucuito real (dossier local verificado):
-// - Serie en cascada O→E: toma vertiente Murinlaya → A alevinaje techado → B engorde outdoor → C acabado outdoor → D pre-descarga outdoor → E descarga → F embalse final (más grande)
+// - Serie en cascada O→E: toma vertiente Murinlaya → A alevinaje techado → B engorde outdoor → C acabado outdoor → D pre-descarga outdoor → E descarga (cierra la serie)
 // - SIN emisario al lago (el agua termina en el estanque F)
 // - Incubadora techada con interior NEGRO
 // - Engorde B OUTDOOR (sin techo)
 const Lx = 20, Lz = 8, aguaY = 1.3;
-const CALLE = 6;   // separación entre estanque y estanque (calle de 6 u)
 const LAYOUT = {
   // Serie en cascada bajando la pendiente O→E, con calle de 6 u entre
-  // estanque y estanque (x: -41 → -25 → +1 → +27 → +53 → +79 → +107)
+  // estanque y estanque (x: -41 → -25 → +1 → +27 → +53 → +79)
   toma: { cx: -41, cz: -5 },                    // compuerta en vertiente Murinlaya
   estanques: [
     { cx: -25, cz: 0, lx: 20, lz: 8,  techado: true,  nombre: "Estanque 1 · Alevinaje" },    // techado (calamina)
     { cx:   1, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 2 · Engorde"    },    // OUTDOOR
     { cx:  27, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 3 · Acabado"    },    // OUTDOOR
     { cx:  53, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 4 · Pre-descarga" },  // OUTDOOR
-    { cx:  79, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 5 · Descarga"   },    // OUTDOOR
-    { cx: 107, cz: 0, lx: 24, lz: 12, techado: false, nombre: "Estanque 6 · Embalse final" }  // más grande, cierra la cascada
+    { cx:  79, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 5 · Descarga"   }     // OUTDOOR, cierra la cascada
   ],
   incubadora: { cx: -10, cz: -16 },             // sala techada, interior negro
   camino: { cx: 0, cz: 0, ancho: 3.2, largo: 60 },
@@ -164,7 +161,7 @@ definirPads([
 ]);
 
 // Terreno SRTM30m de Chucuito (rejilla real cubre x ∈ [-45, 45]; hacia el
-// este se extrapola plano con el borde del heightmap — allí va el estanque 6)
+// este se extrapola plano con el borde del heightmap)
 const geoTerreno = crearMallaTerreno(180, 90, 144, 72);
 const meshTerreno = new Mesh(geoTerreno, new BasicMaterial({ transparent: false }));
 scene.add(meshTerreno);
@@ -277,11 +274,8 @@ const compuertasInfo = [
   // Salida D → entrada E
   { x: LAYOUT.estanques[3].cx + LAYOUT.estanques[3].lx / 2 + 0.1, z: 0, est: 3 },
   { x: LAYOUT.estanques[4].cx - LAYOUT.estanques[4].lx / 2 - 0.1, z: 0, est: 4 },
-  // Salida E → entrada F (embalse final, más grande)
-  { x: LAYOUT.estanques[4].cx + LAYOUT.estanques[4].lx / 2 + 0.1, z: 0, est: 4 },
-  { x: LAYOUT.estanques[5].cx - LAYOUT.estanques[5].lx / 2 - 0.1, z: 0, est: 5 },
-  // Desagüe final (F)
-  { x: LAYOUT.estanques[5].cx + LAYOUT.estanques[5].lx / 2 + 0.1, z: 0, est: 5 }
+  // Desagüe final (E, cierra la cascada; NUNCA al lago)
+  { x: LAYOUT.estanques[4].cx + LAYOUT.estanques[4].lx / 2 + 0.1, z: 0, est: 4 }
 ];
 
 for (const c of compuertasInfo) {
@@ -323,7 +317,7 @@ for (let i = 0; i < LAYOUT.estanques.length - 1; i++) {
   }
 }
 
-// Canal de desagüe corto (embalse final → salida, NUNCA al lago)
+// Canal de desagüe corto (estanque E → salida, NUNCA al lago)
 const iUltimo = LAYOUT.estanques.length - 1;
 const yC = M_ESTANQUE_Y[iUltimo] + aguaY;
 props.push({
@@ -429,11 +423,11 @@ function tramoCerco(x0, z0, x1, z1) {
     }
   }
 }
-tramoCerco(-38, -24, 82, -24);
+tramoCerco(-38, -24, 90, -24);
 tramoCerco(-38, 14, -2.5, 14);
-tramoCerco(2.5, 14, 82, 14);
+tramoCerco(2.5, 14, 90, 14);
 tramoCerco(-38, -24, -38, 14);
-tramoCerco(82, -24, 82, 14);
+tramoCerco(90, -24, 90, 14);
 
 // Vegetación determinista
 function crearAzar(semilla) {
@@ -647,7 +641,7 @@ function dibujarGraficaOd() {
   ctxOd.moveTo(0, y5); ctxOd.lineTo(w, y5);
   ctxOd.stroke();
 
-  const colores = ["#4fc3f7", "#81c784", "#ef5350", "#ffca28", "#ba68c8", "#26c6da"];
+  const colores = ["#4fc3f7", "#81c784", "#ef5350", "#ffca28", "#ba68c8"];
   SIM.historial.forEach((hist, i) => {
     if (hist.length < 2) return;
     ctxOd.strokeStyle = colores[i];

@@ -18,10 +18,9 @@ export const SIM = {
     { nombre: "Estanque 2 · Engorde", m: null },
     { nombre: "Estanque 3 · Acabado", m: null },
     { nombre: "Estanque 4 · Pre-descarga", m: null },
-    { nombre: "Estanque 5 · Descarga", m: null },
-    { nombre: "Estanque 6 · Embalse final", m: null }
+    { nombre: "Estanque 5 · Descarga", m: null }
   ],
-  historial: [[], [], [], [], [], []]
+  historial: [[], [], [], [], []]
 };
 
 export const UMBRALES = {
