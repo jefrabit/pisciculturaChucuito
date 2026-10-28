@@ -1,0 +1,1453 @@
+// ============================================================
+// PISCICULTURA CHUCUITO (CIP/CIPBS - UNAP) — FASE 2
+// Nucleo de render monolitico, Pasos 0 a 15 del curso.
+//
+// Sitio real: altitud 3850 msnm, vertiente Murinlaya por
+// gravedad (245.6 L/min), estanques en SERIE bajando la
+// pendiente O -> E, ultimo estanque de DESCARGA (sin emisario
+// al lago Titicaca). Shaders GLSL inline, texturas 100%
+// procedurales via canvas 2D (sin imagenes ni fetch).
+//
+// ADAPTACION FASE 2: Los pasos 10-15 del curso estan pensados
+// para un Sistema Solar (Sol/Tierra/Luna). Aqui se mapean al
+// dominio de la piscicultura siguiendo la guia de mapeo:
+//   - Paso 10: texturas reales/similares + emisivo (cartel CIP)
+//   - Paso 11: orbita/revlucion/jerarquia (pez-hijo-del-estanque)
+//   - Paso 12: luz puntual (el SOL celeste como luz móvil)
+//   - Paso 13: jerarquia 3 niveles (scene -> estanque -> pez)
+//   - Paso 14: LINEAS orbitales (trayectoria eliptica de los peces)
+//   - Paso 15: camara interactiva (orbital, zoom, teclado)
+//
+// Fase 3 (PENDIENTE / stubbed): refactor modular del Paso 16,
+// simulador hidraulico, panel DOM, etiquetas 3D, picking,
+// UI de reloj/dia-noche.
+//
+// DEV: funciona desde file:// (canvas no tiene CORS).
+// ============================================================
+
+// ------------------------------------------------------------
+// PASO 1 - INICIALIZACION WEBGL2
+// ------------------------------------------------------------
+const canvas = document.getElementById("glCanvas");
+const gl = canvas.getContext("webgl2");
+if (!gl) {
+    throw new Error("WebGL2 no esta disponible en este navegador.");
+}
+gl.viewport(0, 0, canvas.width, canvas.height);
+// Azul profundo altiplanico como color de limpieza.
+gl.clearColor(0.10, 0.18, 0.36, 1.0);
+
+// ============================================================
+// PASO 2/3/5/9/10 - SHADERS
+// El programa DE SUPERFICIE (cuerpos) evoluciona:
+//   Paso 8: normales + Lambert direccional
+//   Paso 10: emisivo (uEmissive), textura + color
+//   Paso 12: luz PUNTUAL (uLightPosition, vWorldPosition)
+// Formato de vertice: pos(3) | normal(3) | uv(2) = 8 floats.
+// ------------------------------------------------------------
+// NOTA DOMINIO: la guia Paso 10 carga jpg desde server. El
+// usuario prohijo assets externos: todas las texturas son ahora
+// canvas 2D subidas con texImage2D + generateMipmap. Esto
+// mantiene file:// funcionando (canvas no tiene CORS) y cubre
+// texturas "reales"-similares: concreto con algas, agua turquesa,
+// piel de trucha, terreno, calamina, madera.
+// ============================================================
+const vertexShaderSource = `#version 300 es
+in vec3 aPosition;
+in vec3 aNormal;
+in vec2 aTexCoord;
+uniform mat4 uModelMatrix;
+uniform mat4 uViewMatrix;
+uniform mat4 uProjectionMatrix;
+uniform mat3 uNormalMatrix;
+out vec3 vNormal;
+out vec3 vWorldPosition;  // Paso 12: posicion del fragmento en mundo
+out vec2 vTexCoord;
+void main() {
+    vec4 worldPosition = uModelMatrix * vec4(aPosition, 1.0);
+    gl_Position = uProjectionMatrix * uViewMatrix * worldPosition;
+    vNormal = normalize(uNormalMatrix * aNormal);  // normal en espacio de vista
+    vWorldPosition = worldPosition.xyz;            // para luz puntual (Paso 12)
+    vTexCoord = aTexCoord;
+}
+`;
+
+const fragmentShaderSource = `#version 300 es
+precision highp float;
+in vec3 vNormal;
+in vec3 vWorldPosition;
+in vec2 vTexCoord;
+uniform vec3 uColor;
+uniform int uUseTexture;
+uniform sampler2D uTexture;
+uniform vec2 uUvOffset;
+uniform int uUseLight;
+uniform vec3 uLightDirection;   // Paso 8: sol direccional (legacy, se mantiene)
+uniform float uAmbient;         // Paso 8
+// --- Paso 10: emisivo ---
+uniform int uEmissive;          // 1 = brilla sin iluminacion (cartel)
+// --- Paso 12: luz puntual móvil ---
+uniform vec3 uLightPosition;    // posicion del sol celeste (puntual)
+uniform float uLightFalloff;    // 1.0 = luz puntual activa, 0.0 = solo ambiental
+out vec4 outColor;
+void main() {
+    vec3 base = uUseTexture == 1 ? texture(uTexture, vTexCoord + uUvOffset).rgb : uColor;
+
+    // Paso 10: emisivo → se dibuja a pantano/full (el cartel CIP se lee de noche).
+    if (uEmissive == 1) {
+        outColor = vec4(base, 1.0);
+        return;
+    }
+
+    if (uUseLight == 1) {
+        // --- Paso 12: luz PUNTUAL (sol celeste) ---
+        // L = dirección desde el fragmento HACIA la fuente puntual.
+        vec3 L = normalize(uLightPosition - vWorldPosition);
+        vec3 N = normalize(vNormal);
+        float difuso = max(dot(N, L), 0.0);
+        // La atenuación: cuando el sol baja del horizonte (uLightFalloff->0)
+        // queda solo el ambiental → escena nocturna con cartel emisivo.
+        float luz = uAmbient + uLightFalloff * (1.0 - uAmbient) * difuso;
+        base = base * luz;
+    }
+    outColor = vec4(base, 1.0);
+}
+`;
+
+// ============================================================
+// PASO 14 - PROGRAMA DE LÍNEAS (orbitas/trayectorias)
+// Las órbitas necesitan posición + color uniforme, sin textura
+// ni iluminación. Un shader simple mantiene el pipeline limpio.
+// ============================================================
+const lineaVertexSource = `#version 300 es
+in vec3 aPosition;
+uniform mat4 uModelMatrix;
+uniform mat4 uViewMatrix;
+uniform mat4 uProjectionMatrix;
+void main() {
+    gl_Position = uProjectionMatrix * uViewMatrix * uModelMatrix * vec4(aPosition, 1.0);
+}
+`;
+
+const lineaFragmentSource = `#version 300 es
+precision highp float;
+uniform vec3 uColor;
+out vec4 outColor;
+void main() {
+    outColor = vec4(uColor, 1.0);
+}
+`;
+
+function crearShader(tipo, fuente) {
+    const shader = gl.createShader(tipo);
+    gl.shaderSource(shader, fuente);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        const error = gl.getShaderInfoLog(shader);
+        gl.deleteShader(shader);
+        throw new Error("Error al compilar shader:\n" + error);
+    }
+    return shader;
+}
+
+function crearPrograma(vsSource, fsSource) {
+    const vs = crearShader(gl.VERTEX_SHADER, vsSource);
+    const fs = crearShader(gl.FRAGMENT_SHADER, fsSource);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        throw new Error("Error al enlazar programa:\n" + gl.getProgramInfoLog(prog));
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    return prog;
+}
+
+// Programa de superficie (cuerpos texturizados + luz puntual).
+const program = crearPrograma(vertexShaderSource, fragmentShaderSource);
+// Programa de líneas (orbitas/trayectorias/cerco).
+const programaLinea = crearPrograma(lineaVertexSource, lineaFragmentSource);
+
+// ------------------------------------------------------------
+// PASO 3/5/6 - MATEMATICA DE MATRICES 4x4 (column-major)
+// REUTILIZA las funciones de Fase 1 (identidad, multiplicar,
+// traslacion, escala, rotacionX/Y/Z, perspectiva, mirarDesde,
+// normalizar, cruzar, componerModelo, inversaTraslacionRigida,
+// normalDesdeModelo). Se conservan tal cual de Fase 1 para no
+// romper el layout.
+// ------------------------------------------------------------
+function identidad() {
+    return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+}
+
+function multiplicarMatrices(a, b) {
+    const r = new Float32Array(16);
+    for (let c = 0; c < 4; c++) {
+        for (let f = 0; f < 4; f++) {
+            r[c * 4 + f] =
+                a[f] * b[c * 4] +
+                a[4 + f] * b[c * 4 + 1] +
+                a[8 + f] * b[c * 4 + 2] +
+                a[12 + f] * b[c * 4 + 3];
+        }
+    }
+    return r;
+}
+
+function traslacion(x, y, z) {
+    const m = identidad();
+    m[12] = x; m[13] = y; m[14] = z;
+    return m;
+}
+
+function escala(x, y, z) {
+    const m = identidad();
+    m[0] = x; m[5] = y; m[10] = z;
+    return m;
+}
+
+function rotacionY(angulo) {
+    const c = Math.cos(angulo), s = Math.sin(angulo);
+    const m = identidad();
+    m[0] = c; m[2] = -s; m[8] = s; m[10] = c;
+    return m;
+}
+
+function rotacionZ(angulo) {
+    const c = Math.cos(angulo), s = Math.sin(angulo);
+    const m = identidad();
+    m[0] = c; m[1] = s; m[4] = -s; m[5] = c;
+    return m;
+}
+
+function rotacionX(angulo) {
+    const c = Math.cos(angulo), s = Math.sin(angulo);
+    const m = identidad();
+    m[5] = c; m[6] = s; m[9] = -s; m[10] = c;
+    return m;
+}
+
+// Paso 6: proyección perspectiva escrita a mano.
+function perspectiva(fovY, aspecto, cerca, lejos) {
+    const f = 1.0 / Math.tan(fovY / 2);
+    const nf = 1 / (cerca - lejos);
+    return new Float32Array([
+        f / aspecto, 0, 0, 0,
+        0, f, 0, 0,
+        0, 0, (lejos + cerca) * nf, -1,
+        0, 0, 2 * lejos * cerca * nf, 0
+    ]);
+}
+
+// Paso 6: camara lookAt escrita a mano.
+function mirarDesde(eye, target, up) {
+    const fz = normalizar([eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]]);
+    const fx = normalizar(cruzar(up, fz));
+    const fy = cruzar(fz, fx);
+    return new Float32Array([
+        fx[0], fy[0], fz[0], 0,
+        fx[1], fy[1], fz[1], 0,
+        fx[2], fy[2], fz[2], 0,
+        -(fx[0]*eye[0] + fx[1]*eye[1] + fx[2]*eye[2]),
+        -(fy[0]*eye[0] + fy[1]*eye[1] + fy[2]*eye[2]),
+        -(fz[0]*eye[0] + fz[1]*eye[1] + fz[2]*eye[2]),
+        1
+    ]);
+}
+
+function cruzar(a, b) {
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0]
+    ];
+}
+
+function normalizar(v) {
+    const l = Math.hypot(v[0], v[1], v[2]) || 1;
+    return [v[0] / l, v[1] / l, v[2] / l];
+}
+
+// Composicion de modelo: T * Rx * Ry * Rz * S.
+function componerModelo(t = [0, 0, 0], rx = 0, ry = 0, rz = 0, s = [1, 1, 1]) {
+    let m = identidad();
+    m = multiplicarMatrices(m, traslacion(t[0], t[1], t[2]));
+    if (rx !== 0) m = multiplicarMatrices(m, rotacionX(rx));
+    if (ry !== 0) m = multiplicarMatrices(m, rotacionY(ry));
+    if (rz !== 0) m = multiplicarMatrices(m, rotacionZ(rz));
+    if (s[0] !== 1 || s[1] !== 1 || s[2] !== 1) {
+        m = multiplicarMatrices(m, escala(s[0], s[1], s[2]));
+    }
+    return m;
+}
+
+function inversaTraslacionRigida(m) {
+    const r = new Float32Array(16);
+    r.set(m);
+    r[12] = 0; r[13] = 0; r[14] = 0;
+    return r;
+}
+
+function normalDesdeModelo(m) {
+    return new Float32Array([
+        m[0], m[1], m[2],
+        m[4], m[5], m[6],
+        m[8], m[9], m[10]
+    ]);
+}
+
+// ------------------------------------------------------------
+// PASO 4 - ESTADO Y RELOJ DE ANIMACION
+// ------------------------------------------------------------
+let tiempoAnterior = 0;
+let primerFrame = true;
+const estado = {
+    giroDemo: 0,       // Paso 4: placeholder que gira lento
+    horaDia: 10.0,     // Paso 8: hora interna del ciclo dia/noche
+    desplazamientoAgua: 0,
+    aireador: 0,
+    // Paso 12: la hora avanza con deltaTime (hook para Fase 3 UI).
+    // velocidadSimulacion configurable -> Futuro: exponer en panel DOM.
+    velocidadSimulacion: 40.0  // 40 segundos reales = 1 dia simulado (~36 min ciclo)
+};
+
+// ------------------------------------------------------------
+// PASO 8 - DIRECCION DEL SOL SEGUN LA HORA (direccional)
+// ponytail: reloj simple de hora-dia; el simulador completo de
+// dia/noche llega en la fase 3.
+// ------------------------------------------------------------
+function direccionSol(hora) {
+    const angulo = ((hora - 6) / 12) * Math.PI; // amanecer en 0, atardecer en PI
+    return normalizar([Math.cos(angulo), 0.55 + 0.45 * Math.sin(angulo), 0.35]);
+}
+
+// ------------------------------------------------------------
+// PASO 12 - POSICION DEL SOL CELU (como fuente PUNTUAL móvil)
+// ------------------------------------------------------------
+// NOTA DOMINIO: en la guia el Sol fisico esta en (0,0,0) y emite
+// luz direccional. Aqui el "sol" es un cuerpo celestial que NO se
+// dibuja (no hay geometría solar); su posicion en el cielo actua
+// como fuente PUNTUAL. El emisor emisivo real es el cartel CIP.
+// Equivalencia: en la guia uLightPosition se pasa (0,0,0); aqui se
+// pasa la posicion celeste calculada. La ecuacion L = normalize(
+// uLightPosition - vWorldPosition) es IDENTICA.
+function posicionSolPuntual(hora) {
+    // Arco celestial: radio grueso (el sol esta lejos, como punto).
+    // Altura sobre el horizonte varía con la hora; cuando baja de
+    // 0 (horizonte) comienza el atardecer/noCHE.
+    const radio = 80;
+    const angulo = ((hora - 6) / 12) * Math.PI;
+    const x = Math.cos(angulo) * radio;
+    const y = 0.55 * radio + 0.45 * radio * Math.sin(angulo); // altura curva
+    const z = Math.sin(angulo) * radio * 0.4;
+    return [x, y, z];
+}
+
+// Factor de atenuación: 1 en pleamar solar, 0 bajo el horizonte.
+function intensidadSolar(hora) {
+    const h = ((hora - 6) / 12) * Math.PI;
+    const altura = Math.sin(h); // -1 .. 1
+    // Suave apagado al atardecer: empieza a caer a 0.15 sobre el horizonte.
+    const t = Math.max(0, Math.min(1, (altura + 0.15) / 1.15));
+    return t;
+}
+
+// ============================================================
+// PASO 5 - GENERACION DE TERRENO
+// Plano subdividido con heightmap procedural: pendiente O -> E
+// (cota alta en -X, baja en +X). Formato: pos|normal|uv = 8 floats.
+// Semilla fija para reproducibilidad.
+// ============================================================
+const TAMANO_TERRENO = 90;
+const SEGMENTOS_TERRENO = 60;
+
+function alturaTerreno(x, z) {
+    // Pendiente principal O -> E: sube hacia -X.
+    const pendiente = -(x / TAMANO_TERRENO) * 6.0;
+    // Ruido suave determinista para irregularidad.
+    const nx = x * 0.15, nz = z * 0.15;
+    const ruido = Math.sin(nx * 1.3 + 0.7) * Math.cos(nz * 1.1 + 0.3) * 0.6
+                + Math.sin(nx * 2.7 + 1.2) * Math.cos(nz * 2.3 + 0.8) * 0.3;
+    // Aplanar la zona central donde van los estanques.
+    const aplanar = Math.max(0, 1.0 - Math.abs(x + 10) / 30) * Math.max(0, 1.0 - Math.abs(z) / 20);
+    return pendiente + ruido * (1.0 - aplanar * 0.8);
+}
+
+function crearMallaTerreno() {
+    const vertices = [];
+    const indices = [];
+    const n = SEGMENTOS_TERRENO;
+    const mitad = TAMANO_TERRENO / 2;
+    for (let fila = 0; fila <= n; fila++) {
+        for (let col = 0; col <= n; col++) {
+            const x = (col / n - 0.5) * TAMANO_TERRENO;
+            const z = (fila / n - 0.5) * TAMANO_TERRENO;
+            const y = alturaTerreno(x, z);
+            // Normal por diferencias finitas.
+            const eps = TAMANO_TERRENO / n;
+            const dx = alturaTerreno(x + eps, z) - alturaTerreno(x - eps, z);
+            const dz = alturaTerreno(x, z + eps) - alturaTerreno(x, z - eps);
+            const normal = normalizar([-dx / (2 * eps), 1.0, -dz / (2 * eps)]);
+            const u = col / n;
+            const v = fila / n;
+            vertices.push(x, y, z, normal[0], normal[1], normal[2], u, v);
+        }
+    }
+    const cols = n + 1;
+    for (let fila = 0; fila < n; fila++) {
+        for (let col = 0; col < n; col++) {
+            const a = fila * cols + col;
+            const b = a + 1;
+            const c = a + cols;
+            const d = c + 1;
+            indices.push(a, c, b, b, c, d);
+        }
+    }
+    return { vertices: new Float32Array(vertices), indices: new Uint16Array(indices) };
+}
+
+// ------------------------------------------------------------
+// PASO 5 - GENERACION DE CAJA (muros de estanque, edificios, etc.)
+// Formato: pos|normal|uv = 8 floats por vertice.
+// ------------------------------------------------------------
+function crearMallaCaja() {
+    // Caja unitaria centrada en origen: -0.5 a +0.5 en cada eje.
+    const caras = [
+        // Frente (+Z)
+        { n: [0,0,1], v: [[-0.5,-0.5,0.5],[0.5,-0.5,0.5],[0.5,0.5,0.5],[-0.5,0.5,0.5]] },
+        // Atras (-Z)
+        { n: [0,0,-1], v: [[0.5,-0.5,-0.5],[-0.5,-0.5,-0.5],[-0.5,0.5,-0.5],[0.5,0.5,-0.5]] },
+        // Derecha (+X)
+        { n: [1,0,0], v: [[0.5,-0.5,0.5],[0.5,-0.5,-0.5],[0.5,0.5,-0.5],[0.5,0.5,0.5]] },
+        // Izquierda (-X)
+        { n: [-1,0,0], v: [[-0.5,-0.5,-0.5],[-0.5,-0.5,0.5],[-0.5,0.5,0.5],[-0.5,0.5,-0.5]] },
+        // Arriba (+Y)
+        { n: [0,1,0], v: [[-0.5,0.5,0.5],[0.5,0.5,0.5],[0.5,0.5,-0.5],[-0.5,0.5,-0.5]] },
+        // Abajo (-Y)
+        { n: [0,-1,0], v: [[-0.5,-0.5,-0.5],[0.5,-0.5,-0.5],[0.5,-0.5,0.5],[-0.5,-0.5,0.5]] }
+    ];
+    const vertices = [];
+    const indices = [];
+    let vi = 0;
+    const uvs = [[0,0],[1,0],[1,1],[0,1]];
+    for (const cara of caras) {
+        for (let i = 0; i < 4; i++) {
+            vertices.push(...cara.v[i], ...cara.n, ...uvs[i]);
+        }
+        indices.push(vi, vi+1, vi+2, vi, vi+2, vi+3);
+        vi += 4;
+    }
+    return { vertices: new Float32Array(vertices), indices: new Uint16Array(indices) };
+}
+
+// ------------------------------------------------------------
+// PASO 5 - PLANO HORIZONTAL (lamina de agua, camino)
+// Formato: pos|normal|uv = 8 floats.
+// ------------------------------------------------------------
+function crearMallaPlano() {
+    const vertices = new Float32Array([
+        -0.5, 0, -0.5,  0, 1, 0,  0, 0,
+         0.5, 0, -0.5,  0, 1, 0,  1, 0,
+         0.5, 0,  0.5,  0, 1, 0,  1, 1,
+        -0.5, 0,  0.5,  0, 1, 0,  0, 1
+    ]);
+    const indices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+    return { vertices, indices };
+}
+
+// ------------------------------------------------------------
+// PASO 7 - GEOMETRIA ESFERICA PROCEDURAL (lat/long)
+// Formato: pos|normal|uv = 8 floats. Costura/polos correctos.
+// ------------------------------------------------------------
+function crearMallaEsfera(radio, segLat, segLon) {
+    const vertices = [];
+    const indices = [];
+    for (let lat = 0; lat <= segLat; lat++) {
+        const v = lat / segLat;
+        const phi = v * Math.PI;
+        for (let lon = 0; lon <= segLon; lon++) {
+            const u = lon / segLon;
+            const theta = u * Math.PI * 2;
+            const nx = Math.sin(phi) * Math.cos(theta);
+            const ny = Math.cos(phi);
+            const nz = Math.sin(phi) * Math.sin(theta);
+            vertices.push(
+                radio * nx, radio * ny, radio * nz,
+                nx, ny, nz,
+                u, v
+            );
+        }
+    }
+    const cols = segLon + 1;
+    for (let lat = 0; lat < segLat; lat++) {
+        for (let lon = 0; lon < segLon; lon++) {
+            const actual = lat * cols + lon;
+            const siguiente = actual + cols;
+            indices.push(actual, siguiente, actual + 1);
+            indices.push(actual + 1, siguiente, siguiente + 1);
+        }
+    }
+    return { vertices: new Float32Array(vertices), indices: new Uint16Array(indices) };
+}
+
+// ------------------------------------------------------------
+// PASO 5 - CAJA, PLANO, ESFERA (ya implementados arriba)
+// ============================================================
+
+// ------------------------------------------------------------
+// PASO 9/10 - TEXTURAS PROCEDURALES VIA CANVAS 2D
+// ------------------------------------------------------------
+// REUTILIZA: crearCanvasTextura, subirTextura (de Fase 1).
+// Se AMPLIAN con generateMipmap + filtros mipmap para texturas
+// que se ven a distinto zoom (cámara interactiva Paso 15).
+//
+// DEV: como todo es canvas, sigue funcionando desde file://
+// (sin CORS). Esto es una DEVIACION JUSTIFICADA de la guia
+// Paso 10 (que carga jpg desde server) por la restriccion
+// "sin imagenes, natural de html/js/css".
+// ------------------------------------------------------------
+function crearCanvasTextura(ancho, alto, dibujar) {
+    const c = document.createElement("canvas");
+    c.width = ancho;
+    c.height = alto;
+    const ctx = c.getContext("2d");
+    dibujar(ctx, ancho, alto);
+    return c;
+}
+
+// Textura "real" con mipmap (para uso con cámara interactiva).
+function subirTexturaMip(canvasElemento) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvasElemento);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    // Filtros mipmap lineales (Paso 10: LINEAR_MIPMAP_LINEAR + LINEAR).
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    // Wrap coherente: REPEAT horizontal, CLAMP_TO_EDGE vertical.
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return tex;
+}
+
+// --- Paso 10: texturas reales/similares (canvas) ---
+
+// Muro de concreto gris rugoso con manchas de algas (estanques/edificios).
+const texturaConcreto = subirTexturaMip(crearCanvasTextura(128, 128, (ctx, w, h) => {
+    ctx.fillStyle = "#8a8a80";
+    ctx.fillRect(0, 0, w, h);
+    // Ruido granular.
+    for (let i = 0; i < 3000; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        const g = 100 + Math.random() * 80;
+        ctx.fillStyle = `rgb(${g},${g},${g - 10})`;
+        ctx.fillRect(x, y, 2, 2);
+    }
+    // Grietas sutiles.
+    ctx.strokeStyle = "rgba(60,60,55,0.3)";
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 6; i++) {
+        ctx.beginPath();
+        ctx.moveTo(Math.random() * w, Math.random() * h);
+        ctx.lineTo(Math.random() * w, Math.random() * h);
+        ctx.stroke();
+    }
+    // Manchas de algas verde-azuladas.
+    for (let i = 0; i < 40; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        const r = 3 + Math.random() * 10;
+        const g = 40 + Math.random() * 30;
+        ctx.fillStyle = `rgba(30,${g},80,0.25)`;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+}));
+
+// Agua turquesa ondulada (estanques).
+const texturaAgua = subirTexturaMip(crearCanvasTextura(128, 128, (ctx, w, h) => {
+    const grad = ctx.createLinearGradient(0, 0, w, h);
+    grad.addColorStop(0, "#2a6e8f");
+    grad.addColorStop(0.5, "#1d5a7a");
+    grad.addColorStop(1, "#2a7090");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+    // Ondas sutiles.
+    ctx.strokeStyle = "rgba(160,200,230,0.18)";
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 12; i++) {
+        ctx.beginPath();
+        const y0 = Math.random() * h;
+        ctx.moveTo(0, y0);
+        ctx.quadraticCurveTo(w * 0.5, y0 + (Math.random() - 0.5) * 14, w, y0);
+        ctx.stroke();
+    }
+    // Brillo de luz solar reflejada.
+    ctx.fillStyle = "rgba(220,240,255,0.25)";
+    ctx.fillRect(w * 0.1, h * 0.1, w * 0.3, h * 0.3);
+}));
+
+// Piel de trucha: plateado + franja rosada lateral + puntos (Paso 10 aplica textura a la esfera de los peces).
+const texturaTrucha = subirTexturaMip(crearCanvasTextura(128, 64, (ctx, w, h) => {
+    // Base plateada.
+    ctx.fillStyle = "#c8d8e8";
+    ctx.fillRect(0, 0, w, h);
+    // Franja rosada lateral (centro horizontal, ancho variable).
+    ctx.fillStyle = "#e8b0b0";
+    ctx.fillRect(w * 0.35, 0, w * 0.3, h);
+    // Puntos oscuros (manchas de trucha).
+    ctx.fillStyle = "#5a6a7a";
+    for (let i = 0; i < 60; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        ctx.beginPath();
+        ctx.arc(x, y, 1 + Math.random() * 2, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    // Reflejo azul lateral.
+    ctx.fillStyle = "rgba(120,160,210,0.18)";
+    ctx.fillRect(0, h * 0.15, w * 0.7, h * 0.25);
+}));
+
+// Terreno: ichu/pasto (alto) ↔ tierra rocosa (bajo).
+const texturaTerreno = subirTexturaMip(crearCanvasTextura(256, 256, (ctx, w, h) => {
+    // Gradiente vertical: pasto (abajo) -> tierra/ichu (arriba).
+    const grad = ctx.createLinearGradient(0, h, 0, 0);
+    grad.addColorStop(0, "#4a7a3a");
+    grad.addColorStop(0.4, "#6b8a4a");
+    grad.addColorStop(0.7, "#8a7a50");
+    grad.addColorStop(1, "#a09060");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+    // Paja brava (ichu): trazos dorados.
+    ctx.strokeStyle = "rgba(190,170,80,0.4)";
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 200; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h * 0.5;
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + (Math.random() - 0.5) * 4, y - 4 - Math.random() * 6);
+        ctx.stroke();
+    }
+    // Ruido de tierra.
+    for (let i = 0; i < 1500; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        ctx.fillStyle = `rgba(${80 + Math.random()*60},${60 + Math.random()*50},${30 + Math.random()*30},0.15)`;
+        ctx.fillRect(x, y, 2, 2);
+    }
+}));
+
+// Calamina del techo (ondulada).
+const texturaCalamina = subirTexturaMip(crearCanvasTextura(128, 64, (ctx, w, h) => {
+    ctx.fillStyle = "#7a8a9a";
+    ctx.fillRect(0, 0, w, h);
+    // Ondas de calamina.
+    for (let x = 0; x < w; x += 8) {
+        ctx.fillStyle = x % 16 === 0 ? "#8a9aaa" : "#6a7a8a";
+        ctx.fillRect(x, 0, 8, h);
+    }
+}));
+
+// Teja (techos de edificios).
+const texturaTeja = subirTexturaMip(crearCanvasTextura(128, 64, (ctx, w, h) => {
+    ctx.fillStyle = "#8b4513";
+    ctx.fillRect(0, 0, w, h);
+    for (let y = 0; y < h; y += 12) {
+        for (let x = 0; x < w; x += 16) {
+            const off = (Math.floor(y / 12) % 2) * 8;
+            ctx.fillStyle = "#a0522d";
+            ctx.beginPath();
+            ctx.arc(x + off + 8, y + 6, 7, Math.PI, 0);
+            ctx.fill();
+        }
+    }
+}));
+
+// Madera del cartel/compuertas.
+const texturaMadera = subirTexturaMip(crearCanvasTextura(128, 64, (ctx, w, h) => {
+    ctx.fillStyle = "#7a4a2a";
+    ctx.fillRect(0, 0, w, h);
+    // Vetas horizontales.
+    for (let y = 0; y < h; y += 4) {
+        const off = (y % 8 === 0) ? 1 : -1;
+        ctx.strokeStyle = `rgba(60,30,12,${0.15 + Math.random()*0.1})`;
+        ctx.lineWidth = 1 + Math.random();
+        ctx.beginPath();
+        ctx.moveTo(off, y);
+        ctx.lineTo(w + off, y);
+        ctx.stroke();
+    }
+    // Textura rugosa.
+    for (let i = 0; i < 800; i++) {
+        const x = Math.random() * w;
+        const y = Math.random() * h;
+        ctx.fillStyle = `rgba(40,20,8,${0.1 + Math.random()*0.1})`;
+        ctx.fillRect(x, y, 1, 1);
+    }
+}));
+
+// Textura emisiva del cartel "CIP CHUCUITO · UNAP" (diseñada para
+// leerse de noche: contraste fuerte sobre fondo oscuro).
+const texturaCartelEmisivo = subirTexturaMip(crearCanvasTextura(256, 128, (ctx, w, h) => {
+    // Fondo negro mate (el cartel es negro de noche).
+    ctx.fillStyle = "#050508";
+    ctx.fillRect(0, 0, w, h);
+    // Logotipo/texto blanco brillante que emite.
+    ctx.fillStyle = "#eaf2fb";
+    ctx.font = "bold 38px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("CIP CHUCUITO", w / 2, h * 0.32);
+    ctx.font = "bold 26px system-ui, sans-serif";
+    ctx.fillText("UNAP", w / 2, h * 0.7);
+    // Cinta decorativa superior.
+    ctx.fillStyle = "#4fc3f7";
+    ctx.fillRect(0, h * 0.12, w, h * 0.06);
+}));
+
+// ------------------------------------------------------------
+// PASO 9/14 - CREACION DE VAOs Y BUFFERS
+// Formato: pos(3)|normal(3)|uv(2) = 8 floats, stride 32 bytes.
+// ------------------------------------------------------------
+function crearVAO(datosMalla, programa) {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, datosMalla.vertices, gl.STATIC_DRAW);
+
+    const ibo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, datosMalla.indices, gl.STATIC_DRAW);
+
+    const stride = 8 * Float32Array.BYTES_PER_ELEMENT;
+    const locPos = gl.getAttribLocation(programa, "aPosition");
+    gl.enableVertexAttribArray(locPos);
+    gl.vertexAttribPointer(locPos, 3, gl.FLOAT, false, stride, 0);
+
+    const locNorm = gl.getAttribLocation(programa, "aNormal");
+    gl.enableVertexAttribArray(locNorm);
+    gl.vertexAttribPointer(locNorm, 3, gl.FLOAT, false, stride, 3 * Float32Array.BYTES_PER_ELEMENT);
+
+    const locUV = gl.getAttribLocation(programa, "aTexCoord");
+    gl.enableVertexAttribArray(locUV);
+    gl.vertexAttribPointer(locUV, 2, gl.FLOAT, false, stride, 6 * Float32Array.BYTES_PER_ELEMENT);
+
+    gl.bindVertexArray(null);
+    return { vao, count: datosMalla.indices.length };
+}
+
+// Geometrias instanciadas (como Fase 1).
+const mallaTerreno = crearVAO(crearMallaTerreno(), program);
+const mallaCaja = crearVAO(crearMallaCaja(), program);
+const mallaPlano = crearVAO(crearMallaPlano(), program);
+const mallaEsfera = crearVAO(crearMallaEsfera(1.0, 24, 32), program);
+// Esfera de baja resolucion para boyas pequeñas.
+const mallaEsferaBoya = crearVAO(crearMallaEsfera(1.0, 12, 16), program);
+
+// ------------------------------------------------------------
+// PASo 14 - VAO PARA LÍNEAS (orbitas/trayectorias)
+// Dibujado con gl.LINE_LOOP; sin índices, solo posición.
+// ------------------------------------------------------------
+function crearVAOLinea(puntos) {
+    gl.useProgram(programaLinea);
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(puntos), gl.STATIC_DRAW);
+
+    const locPos = gl.getAttribLocation(programaLinea, "aPosition");
+    gl.enableVertexAttribArray(locPos);
+    gl.vertexAttribPointer(locPos, 3, gl.FLOAT, false, 0, 0);
+
+    gl.bindVertexArray(null);
+    return { vao, cantidad: puntos.length / 3 };
+}
+
+// Paso 14: geometría procedural de órbita (circunferencia en XZ).
+// La misma funcion sirve para elipse (radios distintos).
+function crearOrbita(radioX, radioZ, segmentos = 64) {
+    const puntos = [];
+    for (let i = 0; i < segmentos; i++) {
+        const t = i / segmentos;
+        const angulo = t * Math.PI * 2;
+        puntos.push(Math.cos(angulo) * radioX, 0, Math.sin(angulo) * radioZ);
+    }
+    return puntos;
+}
+
+// ------------------------------------------------------------
+// PASO 6 - CAMARA MVP (uniforms globales)
+// ------------------------------------------------------------
+const uProjection = gl.getUniformLocation(program, "uProjectionMatrix");
+const uView = gl.getUniformLocation(program, "uViewMatrix");
+const uModel = gl.getUniformLocation(program, "uModelMatrix");
+const uNormalMat = gl.getUniformLocation(program, "uNormalMatrix");
+const uColor = gl.getUniformLocation(program, "uColor");
+const uUseTex = gl.getUniformLocation(program, "uUseTexture");
+const uTex = gl.getUniformLocation(program, "uTexture");
+const uUvOff = gl.getUniformLocation(program, "uUvOffset");
+const uUseLight = gl.getUniformLocation(program, "uUseLight");
+const uSunDir = gl.getUniformLocation(program, "uSunDirection");
+const uAmbient = gl.getUniformLocation(program, "uAmbient");
+// Paso 10: emisivo.
+const uEmissive = gl.getUniformLocation(program, "uEmissive");
+// Paso 12: luz puntual.
+const uLightPosition = gl.getUniformLocation(program, "uLightPosition");
+const uLightFalloff = gl.getUniformLocation(program, "uLightFalloff");
+
+// Uniforms del programa de líneas (Paso 14).
+const uViewLinea = gl.getUniformLocation(programaLinea, "uViewMatrix");
+const uProjectionLinea = gl.getUniformLocation(programaLinea, "uProjectionMatrix");
+const uModelLinea = gl.getUniformLocation(programaLinea, "uModelMatrix");
+const uColorLinea = gl.getUniformLocation(programaLinea, "uColor");
+
+const aspecto = canvas.width / canvas.height;
+const projMatrix = perspectiva(Math.PI / 4, aspecto, 0.1, 200);
+
+// Paso 14: proyección también para el programa de líneas.
+gl.useProgram(programaLinea);
+gl.uniformMatrix4fv(uProjectionLinea, false, projMatrix);
+
+// ------------------------------------------------------------
+// PASO 15 - CAMARA INTERACTIVA (estado esférico)
+// Target fijo en el centro de la cascada de estanques.
+// ------------------------------------------------------------
+// NOTA: la guia Paso 15 usa el centro del Sistema Solar como
+// target. Aqui el target es el centro de la piscicultura.
+// La escena NO se mueve: solo el observador.
+const camera = {
+    target: [0, 2, 0],            // centro de la cascada de estanques
+    distancia: 45,                 // terreno 90×90 → distancia generosa
+    distanciaMin: 8,               // clamp: escena grande
+    distanciaMax: 120,
+    azimut: 0.4,
+    elevacion: 0.35,
+    sensibilidadMouse: 0.006,
+    sensibilidadZoom: 0.015
+};
+
+function limitar(valor, minimo, maximo) {
+    return Math.max(minimo, Math.min(maximo, valor));
+}
+
+function obtenerEyeCamara() {
+    const cosElev = Math.cos(camera.elevacion);
+    const x = camera.target[0] + camera.distancia * cosElev * Math.sin(camera.azimut);
+    const y = camera.target[1] + camera.distancia * Math.sin(camera.elevacion);
+    const z = camera.target[2] + camera.distancia * cosElev * Math.cos(camera.azimut);
+    return [x, y, z];
+}
+
+function obtenerViewCamara() {
+    const eye = obtenerEyeCamara();
+    return mirarDesde(eye, camera.target, [0, 1, 0]);
+}
+
+function reiniciarCamara() {
+    camera.target = [0, 2, 0];
+    camera.distancia = 45;
+    camera.azimut = 0.4;
+    camera.elevacion = 0.35;
+}
+
+// ------------------------------------------------------------
+// PASO 15 - INTERACCION: MOUSE (orbita + zoom)
+// ------------------------------------------------------------
+let arrastrando = false;
+let mouseAnteriorX = 0;
+let mouseAnteriorY = 0;
+
+canvas.addEventListener("mousedown", (evento) => {
+    arrastrando = true;
+    mouseAnteriorX = evento.clientX;
+    mouseAnteriorY = evento.clientY;
+    canvas.classList.add("arrastrando");
+});
+
+window.addEventListener("mouseup", () => {
+    arrastrando = false;
+    canvas.classList.remove("arrastrando");
+});
+
+window.addEventListener("mousemove", (evento) => {
+    if (!arrastrando) return;
+    const dx = evento.clientX - mouseAnteriorX;
+    const dy = evento.clientY - mouseAnteriorY;
+    mouseAnteriorX = evento.clientX;
+    mouseAnteriorY = evento.clientY;
+
+    camera.azimut -= dx * camera.sensibilidadMouse;
+    camera.elevacion += dy * camera.sensibilidadMouse;
+
+    // Evitar los polos (degeneración de lookAt).
+    const limiteVertical = Math.PI / 2 - 0.05;
+    camera.elevacion = limitar(camera.elevacion, -limiteVertical, limiteVertical);
+});
+
+// Rueda: zoom con preventDefault + passive:false (Paso 15).
+canvas.addEventListener("wheel", (evento) => {
+    evento.preventDefault();
+    camera.distancia += evento.deltaY * camera.sensibilidadZoom;
+    camera.distancia = limitar(camera.distancia, camera.distanciaMin, camera.distanciaMax);
+}, { passive: false });
+
+// ------------------------------------------------------------
+// PASO 15 - INTERACCION: TECLADO
+// Flechas (±0.08), +/- (±0.5), R reset.
+// ------------------------------------------------------------
+window.addEventListener("keydown", (evento) => {
+    const pasoAngular = 0.08;
+    const pasoZoom = 0.5;
+    switch (evento.key) {
+        case "ArrowLeft":  camera.azimut -= pasoAngular; evento.preventDefault(); break;
+        case "ArrowRight": camera.azimut += pasoAngular; evento.preventDefault(); break;
+        case "ArrowUp":    camera.elevacion += pasoAngular; evento.preventDefault(); break;
+        case "ArrowDown":  camera.elevacion -= pasoAngular; evento.preventDefault(); break;
+        case "+":
+        case "=": camera.distancia -= pasoZoom; break;
+        case "-": camera.distancia += pasoZoom; break;
+        case "r":
+        case "R": reiniciarCamara(); break;
+    }
+    const limiteVertical = Math.PI / 2 - 0.05;
+    camera.elevacion = limitar(camera.elevacion, -limiteVertical, limiteVertical);
+    camera.distancia = limitar(camera.distancia, camera.distanciaMin, camera.distanciaMax);
+});
+
+// ------------------------------------------------------------
+// PASO 11/13 - ESTADO ANIMADO DE ENTIDADES (ángulos integrados)
+// Las guías usan reloj×factor; aquí se integran con deltaTime
+// para que el movimiento sea independiente del framerate.
+// ------------------------------------------------------------
+const entidad = {
+    trucha: { anguloOrbita: 0, anguloPropio: 0 },
+    boya: { anguloPropio: 0 },
+    aireador: { angulo: 0 }
+};
+
+// ------------------------------------------------------------
+// PASO 11 - CONFIGURACION DE ESCENA
+// Layout dominio (invariantes): serie cascade O->E, toma
+// (compuerta en vertiente), ultimo estanque = descarga sin
+// lago, incubadora techada con interior negro, engorde outdoor.
+// ------------------------------------------------------------
+const POS_TOMA = [-34, 0, -5];
+const POS_ESTANQUE_A = [-16, 0, 0];
+const TAM_ESTANQUE_A = [10, 1.8, 6];
+const POS_ESTANQUE_B = [2, 0, 0];
+const TAM_ESTANQUE_B = [12, 1.6, 7];
+const POS_ESTANQUE_C = [20, 0, 0];
+const TAM_ESTANQUE_C = [8, 1.4, 5];
+const POS_INCUBADORA = [-10, 0, -16];
+const TAM_INCUBADORA = [14, 3, 5];
+const POS_SILO_1 = [-6, 0, -7];
+const POS_SILO_2 = [6, 0, -7];
+const POS_CARTEL = [-4, 0, 11];
+const POS_EDIFICIO_1 = [-8, 0, -24];
+const POS_EDIFICIO_2 = [4, 0, -24];
+
+// Paso 11: parámetros de las elipses de los peces por estanque.
+// Cada pez orbita sobre una elipse alrededor del centro del estanque.
+const ELIPSE_A = { cx: POS_ESTANQUE_A[0], cz: POS_ESTANQUE_A[2], rx: TAM_ESTANQUE_A[0] * 0.32, rz: TAM_ESTANQUE_A[2] * 0.32, radioAgua: TAM_ESTANQUE_A[1] * 0.7 };
+const ELIPSE_B = { cx: POS_ESTANQUE_B[0], cz: POS_ESTANQUE_B[2], rx: TAM_ESTANQUE_B[0] * 0.32, rz: TAM_ESTANQUE_B[2] * 0.32, radioAgua: TAM_ESTANQUE_B[1] * 0.7 };
+const ELIPSE_C = { cx: POS_ESTANQUE_C[0], cz: POS_ESTANQUE_C[2], rx: TAM_ESTANQUE_C[0] * 0.30, rz: TAM_ESTANQUE_C[2] * 0.30, radioAgua: TAM_ESTANQUE_C[1] * 0.6 };
+
+// Posiciones relativas de las truchas dentro de cada estanque
+// (offset respecto al centro del estanque). Cada una lleva su
+// propio ángulo INTEGRADO de órbita alrededor de su elipse.
+const TRUTCHAS = [
+    // estanque A (3 truchas)
+    { estanque: "A", offset: [-2.5, 0.6, 1.5], tam: [0.42, 0.13, 0.11], velOrbita: 0.22, velPropio: 0.15 },
+    { estanque: "A", offset: [-3.8, 0.7, -1.8], tam: [0.38, 0.12, 0.10], velOrbita: 0.18, velPropio: 0.13 },
+    { estanque: "A", offset: [-1.2, 0.55, -0.2], tam: [0.40, 0.13, 0.11], velOrbita: 0.26, velPropio: 0.18 },
+    // estanque B (4 truchas)
+    { estanque: "B", offset: [1.2, 0.5, 1.5], tam: [0.44, 0.14, 0.12], velOrbita: 0.28, velPropio: 0.17 },
+    { estanque: "B", offset: [3.5, 0.6, -1.8], tam: [0.36, 0.12, 0.10], velOrbita: 0.20, velPropio: 0.14 },
+    { estanque: "B", offset: [5.0, 0.5, 0.0], tam: [0.42, 0.13, 0.11], velOrbita: 0.24, velPropio: 0.16 },
+    { estanque: "B", offset: [2.0, 0.55, 2.8], tam: [0.38, 0.12, 0.10], velOrbita: 0.30, velPropio: 0.19 },
+    // estanque C (2 truchas)
+    { estanque: "C", offset: [1.5, 0.4, 0.3], tam: [0.40, 0.12, 0.10], velOrbita: 0.32, velPropio: 0.20 },
+    { estanque: "C", offset: [3.0, 0.5, -0.8], tam: [0.36, 0.12, 0.10], velOrbita: 0.27, velPropio: 0.15 }
+];
+
+// Boyas fijas en estanque B (como Fase 1: posiciones absolutas).
+const POSICIONES_BOYAS = [
+    [-15, 0.5, 1], [2, 0.5, -1], [4, 0.5, 0.5], [-1, 0.5, -0.5]
+].map(p => [POS_ESTANQUE_B[0] + p[0], p[1], POS_ESTANQUE_B[2] + p[2]]);
+
+// VAO de línea para trayectorias de los peces de estanque B (Paso 14).
+const puntosOrbitaTrucha = crearOrbita(ELIPSE_B.rx, ELIPSE_B.rz, 64);
+const vaoOrbitaTrucha = crearVAOLinea(puntosOrbitaTrucha);
+
+// Paso 14: línea del chorro de la cascada (toma -> A -> B -> C).
+// Secuencia descendiente O -> E. Se crea el VAO una sola vez.
+function crearLineaCascada() {
+    const puntos = [];
+    // Punto alto de la toma.
+    puntos.push(POS_TOMA[0], POS_TOMA[1] + 1.2, POS_TOMA[2]);
+    // A (entrada por encima).
+    puntos.push(POS_ESTANQUE_A[0] - TAM_ESTANQUE_A[0] / 2, POS_ESTANQUE_A[1] + TAM_ESTANQUE_A[1] * 0.75, POS_ESTANQUE_A[2]);
+    // B.
+    puntos.push(POS_ESTANQUE_B[0] - TAM_ESTANQUE_B[0] / 2, POS_ESTANQUE_B[1] + TAM_ESTANQUE_B[1] * 0.75, POS_ESTANQUE_B[2]);
+    // C (desague corto, NUNCA al lago).
+    puntos.push(POS_ESTANQUE_C[0] - TAM_ESTANQUE_C[0] / 2, POS_ESTANQUE_C[1] + TAM_ESTANQUE_C[1] * 0.7, POS_ESTANQUE_C[2]);
+    return puntos;
+}
+const puntosCascada = crearLineaCascada();
+const vaoCascada = crearVAOLinea(puntosCascada);
+
+// Paso 14: línea del cerco perimetral (POLYGONAL cerrado).
+function crearLineaCerco() {
+    const puntos = [];
+    const radioCerco = 40;
+    const numPostes = 24;
+    for (let i = 0; i < numPostes; i++) {
+        const ang = (i / numPostes) * Math.PI * 2;
+        puntos.push(Math.cos(ang) * radioCerco, 0.2, Math.sin(ang) * radioCerco);
+    }
+    return puntos;
+}
+const puntosCerco = crearLineaCerco();
+const vaoCerco = crearVAOLinea(puntosCerco);
+
+// ------------------------------------------------------------
+// PASO 6 - CAMARA MVP (valores iniciales; ahora dinámicos Paso 15)
+// ------------------------------------------------------------
+// La viewMatrix se recalcula cada frame (Paso 15). Se envía a ambos
+// programas (superficie + línea) en el render loop.
+let viewMatrix = obtenerViewCamara();
+
+// ------------------------------------------------------------
+// FUNCION DE DIBUJO REUTILIZABLE (superficie)
+// Se EXTIEDE con uEmissive y uLightPosition/uLightFalloff (Paso 12).
+// ------------------------------------------------------------
+function dibujar(malla, modelo, opciones = {}) {
+    const {
+        color = [1, 1, 1],
+        textura = null,
+        usarLuz = true,
+        uvOffset = [0, 0],
+        cull = true,
+        emisivo = false            // Paso 10: brilla sin iluminacion
+    } = opciones;
+
+    gl.useProgram(program);
+    gl.uniformMatrix4fv(uModel, false, modelo);
+    const normalMat = normalDesdeModelo(modelo);
+    gl.uniformMatrix3fv(uNormalMat, false, normalMat);
+    gl.uniform3fv(uColor, color);
+    gl.uniform1i(uUseTex, textura ? 1 : 0);
+    if (textura) {
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, textura);
+        gl.uniform1i(uTex, 0);
+    }
+    gl.uniform2fv(uUvOff, uvOffset);
+    gl.uniform1i(uUseLight, usarLuz ? 1 : 0);
+    gl.uniform3fv(uSunDir, direccionSol(estado.horaDia));
+    gl.uniform1f(uAmbient, 0.12);            // Paso 12: ambiental reducido (sol puntual dominante)
+    gl.uniform1i(uEmissive, emisivo ? 1 : 0); // Paso 10
+
+    // Paso 12: posición puntual del sol celeste + atenuación.
+    const solPos = posicionSolPuntual(estado.horaDia);
+    gl.uniform3fv(uLightPosition, solPos);
+    gl.uniform1f(uLightFalloff, intensidadSolar(estado.horaDia));
+
+    if (cull) { gl.enable(gl.CULL_FACE); } else { gl.disable(gl.CULL_FACE); }
+
+    gl.bindVertexArray(malla.vao);
+    gl.drawElements(gl.TRIANGLES, malla.count, gl.UNSIGNED_SHORT, 0);
+    gl.bindVertexArray(null);
+}
+
+// Paso 14: dibujo de líneas (orbitas/cascada/cerco).
+function dibujarLinea(vaoLinea, modelo, color) {
+    gl.useProgram(programaLinea);
+    gl.uniformMatrix4fv(uModelLinea, false, modelo);
+    gl.uniform3f(uColorLinea, color[0], color[1], color[2]);
+    gl.bindVertexArray(vaoLinea.vao);
+    gl.drawArrays(gl.LINE_LOOP, 0, vaoLinea.cantidad);
+    gl.bindVertexArray(null);
+}
+
+// Paso 14: dibujo de línea abierto (cascada usa LINE_STRIP).
+function dibujarLineaStrip(vaoLinea, modelo, color) {
+    gl.useProgram(programaLinea);
+    gl.uniformMatrix4fv(uModelLinea, false, modelo);
+    gl.uniform3f(uColorLinea, color[0], color[1], color[2]);
+    gl.bindVertexArray(vaoLinea.vao);
+    gl.drawArrays(gl.LINE_STRIP, 0, vaoLinea.cantidad);
+    gl.bindVertexArray(null);
+}
+
+// ------------------------------------------------------------
+// PASO 11/13 - JERARQUÍA DE TRANSFORMACIONES
+// Paso 13 exige: scene -> estanque -> pez, y
+// scene -> incubadora -> artesa -> agua.
+// La cascada (toma->A->B->C) es una secuencia de traslaciones
+// descendentes que modela el flujo por gravedad.
+// ------------------------------------------------------------
+
+// Helper Paso 13: posición del centro de un estanque.
+function centroEstanque(estanque) {
+    switch (estanque) {
+        case "A": return [POS_ESTANQUE_A[0], POS_ESTANQUE_A[1], POS_ESTANQUE_A[2]];
+        case "B": return [POS_ESTANQUE_B[0], POS_ESTANQUE_B[1], POS_ESTANQUE_B[2]];
+        case "C": return [POS_ESTANQUE_C[0], POS_ESTANQUE_C[1], POS_ESTANQUE_C[2]];
+        default: return [0, 0, 0];
+    }
+}
+function elipseEstanque(estanque) {
+    switch (estanque) {
+        case "A": return ELIPSE_A;
+        case "B": return ELIPSE_B;
+        case "C": return ELIPSE_C;
+        default: return ELIPSE_B;
+    }
+}
+
+// ------------------------------------------------------------
+// PASO 4 - RENDER LOOP
+// requestAnimationFrame + deltaTime. Separar actualizar/renderizar.
+// ------------------------------------------------------------
+function actualizar(dt) {
+    anguloGiroDemo += 0.3 * dt;
+    estado.desplazamientoAgua += dt * 0.02;
+    estado.aireador += dt * 2.0;
+
+    // Paso 12: hora interna del ciclo día/noche (hook Fase 3).
+    // Avanza con deltaTime; velocidadSimulacion configurable.
+    estado.horaDia += (dt * estado.velocidadSimulacion) / 86400;
+    if (estado.horaDia >= 24) estado.horaDia -= 24;
+
+    // Paso 11: ángulos INTEGRADOS (no reloj×factor).
+    const v = 1; // velocidad base integrada
+    entidad.trucha.anguloOrbita += dt * v * 0.22;
+    entidad.trucha.anguloPropio += dt * v * 0.15;
+    entidad.boya.anguloPropio += dt * v * 0.3;
+    entidad.aireador.angulo += dt * v * 1.0;
+}
+
+let anguloGiroDemo = 0;
+
+function renderizar() {
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    // Paso 15: View se recalcula cada frame y se envía a AMBOS programas.
+    viewMatrix = obtenerViewCamara();
+
+    gl.useProgram(program);
+    gl.uniformMatrix4fv(uProjection, false, projMatrix);
+    gl.uniformMatrix4fv(uView, false, viewMatrix);
+
+    gl.useProgram(programaLinea);
+    gl.uniformMatrix4fv(uProjectionLinea, false, projMatrix);
+    gl.uniformMatrix4fv(uViewLinea, false, viewMatrix);
+
+    // === PASO 14: DRAW DE LÍNEAS (orbitas/trayectorias/cerco) ===
+    // Cascada (LINE_STRIP), orbita trucha B y cerco (LINE_LOOP).
+    dibujarLineaStrip(vaoCascada, identidad(), [0.35, 0.55, 0.95]);
+    dibujarLinea(vaoOrbitaTrucha, identidad(), [0.25, 0.65, 0.45]);
+    dibujarLinea(vaoCerco, identidad(), [0.45, 0.35, 0.25]);
+
+    // --- TERRENO ---
+    dibujar(mallaTerreno, identidad(), {
+        textura: texturaTerreno,
+        usarLuz: true
+    });
+
+    // --- ESTANQUE A (techado) ---
+    dibujar(mallaCaja, componerModelo(POS_ESTANQUE_A, 0, 0, 0, TAM_ESTANQUE_A), {
+        textura: texturaConcreto,
+        usarLuz: true
+    });
+    dibujar(mallaPlano, componerModelo(
+        [POS_ESTANQUE_A[0], POS_ESTANQUE_A[1] + TAM_ESTANQUE_A[1] * 0.7, POS_ESTANQUE_A[2]],
+        0, 0, 0,
+        [TAM_ESTANQUE_A[0] * 0.9, 1, TAM_ESTANQUE_A[2] * 0.9]
+    ), {
+        textura: texturaAgua,
+        usarLuz: true,
+        uvOffset: [estado.desplazamientoAgua, 0],
+        cull: false
+    });
+    // Techo de calamina.
+    dibujar(mallaCaja, componerModelo(
+        [POS_ESTANQUE_A[0], POS_ESTANQUE_A[1] + TAM_ESTANQUE_A[1] + 0.8, POS_ESTANQUE_A[2]],
+        0, 0, 0,
+        [TAM_ESTANQUE_A[0] + 1, 0.15, TAM_ESTANQUE_A[2] + 1]
+    ), { textura: texturaCalamina, usarLuz: true });
+
+    // --- ESTANQUE B (engorde, OUTDOOR: sin techo) ---
+    dibujar(mallaCaja, componerModelo(POS_ESTANQUE_B, 0, 0, 0, TAM_ESTANQUE_B), {
+        textura: texturaConcreto, usarLuz: true
+    });
+    dibujar(mallaPlano, componerModelo(
+        [POS_ESTANQUE_B[0], POS_ESTANQUE_B[1] + TAM_ESTANQUE_B[1] * 0.7, POS_ESTANQUE_B[2]],
+        0, 0, 0,
+        [TAM_ESTANQUE_B[0] * 0.9, 1, TAM_ESTANQUE_B[2] * 0.9]
+    ), {
+        textura: texturaAgua, usarLuz: true,
+        uvOffset: [estado.desplazamientoAgua * 1.2, 0], cull: false
+    });
+
+    // --- ESTANQUE C (descarga/sedimentacion, OUTDOOR, ULTIMO) ---
+    dibujar(mallaCaja, componerModelo(POS_ESTANQUE_C, 0, 0, 0, TAM_ESTANQUE_C), {
+        textura: texturaConcreto, usarLuz: true
+    });
+    dibujar(mallaPlano, componerModelo(
+        [POS_ESTANQUE_C[0], POS_ESTANQUE_C[1] + TAM_ESTANQUE_C[1] * 0.6, POS_ESTANQUE_C[2]],
+        0, 0, 0,
+        [TAM_ESTANQUE_C[0] * 0.9, 1, TAM_ESTANQUE_C[2] * 0.9]
+    ), {
+        textura: texturaAgua, usarLuz: true,
+        uvOffset: [estado.desplazamientoAgua * 0.8, 0], cull: false
+    });
+    // Canal de desague corto (NUNCA al lago).
+    dibujar(mallaCaja, componerModelo(
+        [POS_ESTANQUE_C[0] + TAM_ESTANQUE_C[0] / 2 + 2, POS_ESTANQUE_C[1], POS_ESTANQUE_C[2]],
+        0, 0, 0, [3, 0.5, 1]
+    ), { textura: texturaConcreto, usarLuz: true });
+
+    // --- TOMA (compuerta en vertiente, NO deposito elevado) ---
+    dibujar(mallaCaja, componerModelo(POS_TOMA, 0, 0, 0, [3, 2.5, 3]), {
+        textura: texturaConcreto, usarLuz: true
+    });
+    // Compuerta (placa metalica).
+    dibujar(mallaCaja, componerModelo(
+        [POS_TOMA[0] + 1.8, POS_TOMA[1] + 1.5, POS_TOMA[2]],
+        0, 0, 0, [0.2, 1.5, 2]
+    ), { color: [0.4, 0.45, 0.5], usarLuz: true });
+
+    // --- INCUBADORA (sala techada, interior NEGRO) ---
+    // Paso 13: scene -> incubadora (nivel 1: traslación del edificio).
+    const matrizIncubadora = componerModelo(POS_INCUBADORA, 0, 0, 0, TAM_INCUBADORA);
+    dibujar(mallaCaja, matrizIncubadora, {
+        textura: texturaConcreto, usarLuz: true
+    });
+    // Interior negro (artesas de incubacion pintadas de negro).
+    dibujar(mallaCaja, componerModelo(
+        [POS_INCUBADORA[0], POS_INCUBADORA[1] + 0.5, POS_INCUBADORA[2]],
+        0, 0, 0,
+        [TAM_INCUBADORA[0] - 1, TAM_INCUBADORA[1] - 1.2, TAM_INCUBADORA[2] - 1]
+    ), { color: [0.05, 0.05, 0.05], usarLuz: false });
+    // Techo de calamina.
+    dibujar(mallaCaja, componerModelo(
+        [POS_INCUBADORA[0], POS_INCUBADORA[1] + TAM_INCUBADORA[1] + 0.3, POS_INCUBADORA[2]],
+        0, 0, 0,
+        [TAM_INCUBADORA[0] + 1.5, 0.15, TAM_INCUBADORA[2] + 1]
+    ), { textura: texturaCalamina, usarLuz: true });
+
+    // --- ARTESAS de incubación (Paso 13: incubadora -> artesa -> agua) ---
+    // La artesa hereda la TRASLACIÓN del padre (incubadora) pero NO su
+    // escala (como en la guía: M_tierra_sistema ≠ M_tierra_visual).
+    // M_mundo_artesa = T(incubadora) · T(local) · S(local)
+    const matrizIncubadoraTraslacion = traslacion(
+        POS_INCUBADORA[0], POS_INCUBADORA[1], POS_INCUBADORA[2]
+    );
+    for (let i = 0; i < 3; i++) {
+        // Posición LOCAL relativa al origen de la incubadora.
+        const localOffset = [-4 + i * 4, 0.3, -4];
+        const mArtesaLocal = componerModelo(localOffset, 0, 0, 0, [3, 0.8, 1.2]);
+        const mArtesaMundo = multiplicarMatrices(matrizIncubadoraTraslacion, mArtesaLocal);
+        dibujar(mallaCaja, mArtesaMundo, { color: [0.08, 0.08, 0.08], usarLuz: false });
+        // Agua dentro de la artesa (nivel 3: artesa -> agua).
+        const mAguaLocal = componerModelo([0, 0.35, 0], 0, 0, 0, [2.6, 1, 1]);
+        const mAguaMundo = multiplicarMatrices(mArtesaMundo, mAguaLocal);
+        dibujar(mallaPlano, mAguaMundo, { color: [0.18, 0.48, 0.58], usarLuz: true, cull: false });
+    }
+
+    // --- SILOS de alimento ---
+    for (const posSilo of [POS_SILO_1, POS_SILO_2]) {
+        // Cuerpo cilindrico aproximado con esfera escalada.
+        dibujar(mallaEsfera, componerModelo(
+            [posSilo[0], posSilo[1] + 2.5, posSilo[2]],
+            0, 0, 0, [1.2, 2.5, 1.2]
+        ), { color: [0.7, 0.72, 0.75], usarLuz: true });
+        dibujar(mallaCaja, componerModelo(
+            [posSilo[0], posSilo[1] + 0.3, posSilo[2]],
+            0, 0, 0, [1.8, 0.6, 1.8]
+        ), { textura: texturaConcreto, usarLuz: true });
+    }
+
+    // --- BOYAS (Paso 7: esferas pequeñas) ---
+    for (const posBoya of POSICIONES_BOYAS) {
+        dibujar(mallaEsferaBoya, componerModelo(
+            posBoya,
+            0, estado.aireador * 0.5, 0, [0.15, 0.15, 0.15]
+        ), { color: [0.9, 0.3, 0.1], usarLuz: true });
+    }
+
+    // ============================================================
+    // PASO 11/13: TRUTCHAS COMO HIJOS DEL ESTANQUE (jerarquía 3 niveles)
+    //   scene → estanque → pez
+    //   M_mundo = M_estanque · M_local
+    //   M_local = T(punto elipse) · R(rumbo tangente) · S(talla)
+    // Revolución = avance por la elipse (ángulo INTEGRADO, no
+    // reloj×factor). Rotación propia = orientación del cuerpo por
+    // la tangente de la elipse.
+    // ============================================================
+    for (let i = 0; i < TRUTCHAS.length; i++) {
+        const t = TRUTCHAS[i];
+        const e = elipseEstanque(t.estanque);
+        const ce = centroEstanque(t.estanque);
+        // Ángulo INTEGRADO con fase independiente por trucha.
+        const ang = entidad.trucha.anguloOrbita * t.velOrbita + i * 1.7;
+        // Punto de la elipse (revolución orbital).
+        const rx = Math.cos(ang) * e.rx;
+        const rz = Math.sin(ang) * e.rz;
+        // Tangente → orientación del cuerpo (rumbo tangencial).
+        const tx = -Math.sin(ang) * e.rx;
+        const tz = Math.cos(ang) * e.rz;
+        const rumbo = Math.atan2(tx, tz);
+
+        // Paso 13: M_local = T(centro elipse sobre superficie agua) · R(rumbo) · S(talla)
+        const mLocal = componerModelo(
+            [rx, ce[1] + e.radioAgua, rz],
+            0, rumbo, 0, t.tam
+        );
+        // M_estanque posiciona el centro del estanque en el mundo.
+        const mEstanque = traslacion(ce[0], ce[1], ce[2]);
+        // M_mundo = M_estanque · M_local  → pez hereda del estanque.
+        const mundo = multiplicarMatrices(mEstanque, mLocal);
+        dibujar(mallaEsferaBoya, mundo, {
+            textura: texturaTrucha,
+            usarLuz: true
+        });
+    }
+
+    // --- EDIFICIOS admin/lab (techo de teja) ---
+    for (const posEd of [POS_EDIFICIO_1, POS_EDIFICIO_2]) {
+        dibujar(mallaCaja, componerModelo(posEd, 0, 0, 0, [8, 3, 6]), {
+            textura: texturaConcreto, usarLuz: true
+        });
+        dibujar(mallaCaja, componerModelo(
+            [posEd[0], posEd[1] + 3.4, posEd[2]],
+            0, 0, 0, [9, 0.5, 7]
+        ), { textura: texturaTeja, usarLuz: true });
+    }
+
+    // === PASO 10: CARTEL "CIP CHUCUITO · UNAP" EMISIVO ===
+    // Poste de madera.
+    dibujar(mallaCaja, componerModelo(
+        [POS_CARTEL[0], POS_CARTEL[1] + 2, POS_CARTEL[2]],
+        0, 0, 0, [0.2, 4, 0.2]
+    ), { textura: texturaMadera, usarLuz: true });
+    // Panel del cartel: EMISIVO (se lee de noche). Paso 10.
+    dibujar(mallaCaja, componerModelo(
+        [POS_CARTEL[0], POS_CARTEL[1] + 4.2, POS_CARTEL[2]],
+        0, 0, 0, [5, 1.5, 0.1]
+    ), { textura: texturaCartelEmisivo, usarLuz: true, emisivo: true });
+
+    // --- CAMINO de tierra ---
+    dibujar(mallaPlano, componerModelo([0, 0.05, 0], 0, 0, 0, [60, 1, 4]), {
+        color: [0.55, 0.45, 0.3], usarLuz: true, cull: false
+    });
+
+    // --- CERCO PERIMETRAL (postes simples) ===
+    const radioCercoPostes = 40;
+    const numPostes = 24;
+    for (let i = 0; i < numPostes; i++) {
+        const ang = (i / numPostes) * Math.PI * 2;
+        const px = Math.cos(ang) * radioCercoPostes;
+        const pz = Math.sin(ang) * radioCercoPostes;
+        dibujar(mallaCaja, componerModelo([px, alturaTerreno(px, pz) + 1, pz], 0, 0, 0, [0.15, 2, 0.15]), {
+            color: [0.4, 0.35, 0.3], usarLuz: true
+        });
+    }
+
+    // --- VEGETACION ---
+    // Ichu al oeste (x < -25): esferas pequeñas doradas.
+    for (let i = 0; i < 15; i++) {
+        const ix = -28 - (i % 5) * 2.5;
+        const iz = -15 + Math.floor(i / 5) * 8;
+        const iy = alturaTerreno(ix, iz);
+        dibujar(mallaEsferaBoya, componerModelo([ix, iy + 0.4, iz], 0, i * 0.7, 0, [0.6, 0.8, 0.6]), {
+            color: [0.75, 0.68, 0.3], usarLuz: true
+        });
+    }
+    // Totora al extremo este (fondo, cerca del lago lejano).
+    for (let i = 0; i < 10; i++) {
+        const tx = 38 + (i % 5) * 2;
+        const tz = -8 + Math.floor(i / 5) * 5;
+        dibujar(mallaCaja, componerModelo([tx, alturaTerreno(tx, tz) + 1, tz], 0, 0, 0, [0.1, 2.5, 0.1]), {
+            color: [0.3, 0.5, 0.2], usarLuz: true
+        });
+    }
+    // Eucaliptos junto a edificios.
+    for (let i = 0; i < 4; i++) {
+        const ex = POS_EDIFICIO_1[0] - 3 + i * 5;
+        const ez = POS_EDIFICIO_1[2] + 5;
+        dibujar(mallaCaja, componerModelo([ex, alturaTerreno(ex, ez) + 2, ez], 0, 0, 0, [0.3, 4, 0.3]), {
+            color: [0.4, 0.3, 0.2], usarLuz: true
+        });
+        dibujar(mallaEsferaBoya, componerModelo([ex, alturaTerreno(ex, ez) + 4.5, ez], 0, 0, 0, [1.5, 1.8, 1.5]), {
+            color: [0.2, 0.45, 0.2], usarLuz: true
+        });
+    }
+
+    // --- AIREADORES de superficie (en estanque B) ---
+    dibujar(mallaCaja, componerModelo(
+        [POS_ESTANQUE_B[0] - 2, POS_ESTANQUE_B[1] + TAM_ESTANQUE_B[1] * 0.7 + 0.2, POS_ESTANQUE_B[2] + 2],
+        0, estado.aireador, 0, [0.5, 0.3, 0.5]
+    ), { color: [0.6, 0.6, 0.65], usarLuz: true });
+
+    // --- ESCALA DE NIVEL (junto a estanque A) ---
+    dibujar(mallaCaja, componerModelo(
+        [POS_ESTANQUE_A[0] + TAM_ESTANQUE_A[0] / 2 + 0.5, POS_ESTANQUE_A[1] + 1, POS_ESTANQUE_A[2]],
+        0, 0, 0, [0.1, 1.5, 0.3]
+    ), { color: [0.9, 0.9, 0.2], usarLuz: true });
+
+    // Paso 13: verificación numérica de herencia jerárquica (stub).
+    // verificarHerencia();
+}
+
+// ------------------------------------------------------------
+// PASO 13 - VERIFICACION NUMERICA DE JERARQUIA (test de consola)
+// Se ejecuta una sola vez al inicio para validar que la Luna/
+// pez hereda la traslación del padre. NO se llama en runtime.
+// ------------------------------------------------------------
+function verificarHerencia() {
+    // Pez en estanque B: M_mundo = M_estanque · M_local
+    const ce = centroEstanque("B");
+    const mEstanque = traslacion(ce[0], ce[1], ce[2]);
+    const mLocal = componerModelo([1, 0.6, 0.5], 0, 0, 0, [0.4, 0.12, 0.11]);
+    const mundo = multiplicarMatrices(mEstanque, mLocal);
+    // La columna de traslación (índices 12,13,14) debe ser la suma.
+    const esperado = [ce[0] + 1, ce[1] + 0.6, ce[2] + 0.5];
+    const ok = Math.abs(mundo[12] - esperado[0]) < 1e-5 &&
+               Math.abs(mundo[13] - esperado[1]) < 1e-5 &&
+               Math.abs(mundo[14] - esperado[2]) < 1e-5;
+    console.assert(ok, "HERENCIA: la traslación del pez no heredó el estanque");
+    return ok;
+}
+
+// ------------------------------------------------------------
+// PASO 4 - LOOP PRINCIPAL
+// ------------------------------------------------------------
+function loopPrincipal(ms) {
+    const tiempo = ms * 0.001;
+    const dt = primerFrame ? 0 : Math.min(tiempo - tiempoAnterior, 0.1);
+    tiempoAnterior = tiempo;
+    primerFrame = false;
+
+    actualizar(dt);
+    renderizar();
+
+    requestAnimationFrame(loopPrincipal);
+}
+
+// Paso 13: validación numérica de herencia (una vez, en consola).
+verificarHerencia();
+
+requestAnimationFrame(loopPrincipal);

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Digital Twin · Piscicultura de Chucuito, Puno (Paso 16)</title>
+  <link rel="icon" href="data:,">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      gap: 16px;
+      padding: 16px;
+      background: #05070c;
+      color: #dce6f2;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+
+    /* Contenedor del canvas: las etiquetas 3D se posicionan encima */
+    #escena { position: relative; flex: 0 0 auto; line-height: 0; }
+    canvas#glCanvas {
+      border: 1px solid #26344a;
+      border-radius: 8px;
+      background: #05070c;
+      cursor: grab;
+      max-width: 100%;
+    }
+    canvas#glCanvas:active, canvas#glCanvas.arrastrando { cursor: grabbing; }
+
+    #etiquetas { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+    .etiqueta {
+      position: absolute;
+      transform: translate(-50%, -100%);
+      background: rgba(10, 17, 27, 0.86);
+      border: 1px solid #2f445e;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+      line-height: 1.35;
+      color: #dce6f2;
+      white-space: nowrap;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+    }
+    .etiqueta b { display: block; color: #eaf2fb; font-size: 11px; }
+    .etiqueta span { color: #8ba0b8; margin-right: 8px; }
+    .etiqueta.sensor { border-color: #2f6b8a; }
+    .etiqueta.sensor b { color: #4fc3f7; }
+    .etiqueta.cartel { border-color: #7a4a2f; background: rgba(28, 18, 10, 0.88); }
+    .etiqueta.cartel b { color: #ffb877; }
+    .etiqueta.edificio { border-color: #4a4a52; }
+    .etiqueta.edificio b { color: #cfd8e3; }
+    .etiqueta::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      bottom: -6px;
+      width: 1px;
+      height: 6px;
+      background: #4a627c;
+    }
+
+    #hud {
+      width: 312px;
+      flex: 0 0 312px;
+      max-height: 660px;
+      overflow-y: auto;
+      background: #0d1420;
+      border: 1px solid #26344a;
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-size: 13px;
+    }
+    #hud h1 { font-size: 15px; margin: 0 0 4px; color: #eaf2fb; }
+    #hud .sub { color: #7d93ad; font-size: 11px; margin: 0 0 12px; }
+
+    .reloj { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+    .reloj .hora { font-size: 26px; font-weight: 700; color: #4fc3f7; font-variant-numeric: tabular-nums; }
+    .reloj .meta { color: #9fb2c8; font-size: 12px; }
+    .estado { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .estado.ok { background: #14351f; color: #81c784; }
+    .estado.info { background: #12283c; color: #64b5f6; }
+    .estado.advertencia { background: #3c2f10; color: #ffca28; }
+    .estado.critica { background: #3c1414; color: #ef5350; }
+
+    .controles { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 6px; }
+    .grupo-titulo {
+      width: 100%;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: #6f8298;
+      margin: 8px 0 2px;
+    }
+    button {
+      background: #182636; color: #dce6f2;
+      border: 1px solid #2f445e; border-radius: 6px; padding: 6px 10px;
+      font-size: 12px; cursor: pointer;
+    }
+    button:hover { background: #22354a; }
+    button.accion { background: #1c3a2a; border-color: #2f5c40; }
+    button.accion:hover { background: #245038; }
+    button.vista { background: #152231; font-size: 11px; padding: 5px 8px; }
+
+    .card { background: #111b29; border: 1px solid #223046; border-radius: 8px; padding: 8px 10px; margin-bottom: 10px; }
+    .card h3 { margin: 0 0 6px; font-size: 12px; color: #b9cbe0; font-weight: 600; }
+    .fila { display: grid; grid-template-columns: 1fr auto 44px; gap: 4px; align-items: baseline; padding: 2px 4px; border-radius: 4px; }
+    .fila .etq { color: #8ba0b8; }
+    .fila .val { font-variant-numeric: tabular-nums; font-weight: 600; color: #eaf2fb; }
+    .fila .uni { color: #6f8298; font-size: 11px; text-align: right; }
+    .fila.advertencia .val { color: #ffca28; }
+    .fila.critica .val { color: #ef5350; }
+
+    #alertas { margin: 4px 0 12px; }
+    .alerta { padding: 5px 8px; border-radius: 5px; font-size: 12px; margin-bottom: 4px; }
+    .alerta.ok { background: #14351f; color: #81c784; }
+    .alerta.advertencia { background: #3c2f10; color: #ffca28; }
+    .alerta.critica { background: #3c1414; color: #ef5350; }
+
+    .grafica-wrap { margin-top: 6px; }
+    .grafica-wrap .titulo { font-size: 11px; color: #8ba0b8; margin-bottom: 4px; }
+    #graficaOd { width: 100%; height: 90px; border: 1px solid #223046; border-radius: 6px; background: #0d1420; }
+    .leyenda { font-size: 10px; color: #6f8298; margin-top: 4px; }
+    .leyenda .azul { color: #4fc3f7; } .leyenda .verde { color: #81c784; } .leyenda .rojo { color: #ef5350; }
+    .leyenda .amarillo { color: #ffca28; }
+    .leyenda .morado { color: #ba68c8; }
+    .leyenda .cian { color: #26c6da; }
+
+    #ayuda { color: #6f8298; font-size: 11px; line-height: 1.5; margin-top: 12px; border-top: 1px solid #223046; padding-top: 8px; }
+    kbd { background: #182636; border: 1px solid #2f445e; border-radius: 4px; padding: 0 4px; font-size: 10px; }
+
+    /* Panel de detalle del estanque (aparece al hacer clic) */
+    #detalle {
+      display: none;
+      position: fixed;
+      left: 18px;
+      bottom: 18px;
+      width: 470px;
+      background: #0d1420;
+      border: 1px solid #2f445e;
+      border-radius: 10px;
+      padding: 12px 14px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, .6);
+      z-index: 10;
+    }
+    .det-cab { display: flex; justify-content: space-between; align-items: center; }
+    .det-cab h3 { margin: 0 0 8px; font-size: 13px; color: #4fc3f7; }
+    .det-cab button { padding: 2px 8px; }
+    .det-tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+    .det-tabs button { font-size: 11px; padding: 3px 8px; }
+    .det-tabs button.activo { background: #1d3d55; border-color: #3f7ba3; color: #bfe6ff; }
+    #det-grafica { width: 100%; height: 150px; border: 1px solid #223046; border-radius: 6px; background: #0d1420; }
+    .det-valores { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div id="escena">
+    <canvas id="glCanvas" width="900" height="620"></canvas>
+    <div id="etiquetas"></div>
+  </div>
+
+  <aside id="hud">
+    <h1>Digital Twin · Piscicultura Chucuito</h1>
+    <p class="sub">CIP Chucuito UNAP — Paso 16 Mini Motor Gráfico (ES Modules)</p>
+
+    <div class="reloj">
+      <span class="hora" id="hora">--:--</span>
+      <span class="meta"><span id="dia">Día 0</span> · <span id="velocidad">5×</span></span>
+      <span id="estado" class="estado ok">Día</span>
+    </div>
+
+    <div class="controles">
+      <div class="grupo-titulo">Simulación</div>
+      <button id="btnPausa">⏸ Pausa</button>
+      <button id="btnMas">Velocidad +</button>
+      <button id="btnMenos">Velocidad −</button>
+      <div class="grupo-titulo">Eventos</div>
+      <button id="btnAlimentar" class="accion">Alimentar</button>
+      <button id="btnLluvia" class="accion">Lluvia</button>
+      <button id="btnFloracion" class="accion">Floración</button>
+      <button id="btnHelada" class="accion">Helada</button>
+      <div class="grupo-titulo">Vistas</div>
+      <button class="vista" data-vista="general">General</button>
+      <button class="vista" data-vista="estanque-1">Estanque 1</button>
+      <button class="vista" data-vista="estanque-2">Estanque 2</button>
+      <button class="vista" data-vista="estanque-3">Estanque 3</button>
+      <button class="vista" data-vista="estanque-4">Estanque 4</button>
+      <button class="vista" data-vista="estanque-5">Estanque 5</button>
+      <button class="vista" data-vista="estanque-6">Estanque 6</button>
+      <button class="vista" data-vista="incubadora">Incubadora</button>
+      <button class="vista" id="btnReset">Reset vista</button>
+    </div>
+
+    <div id="estanques"></div>
+    <div id="alertas"></div>
+
+    <div class="grafica-wrap">
+      <div class="titulo">Oxígeno disuelto · últimas 24 h (línea roja = 5 mg/L)</div>
+      <canvas id="graficaOd" width="280" height="90"></canvas>
+      <div class="leyenda">
+        <span class="azul">■ Estanque 1</span> &nbsp;
+        <span class="verde">■ Estanque 2</span> &nbsp;
+        <span class="rojo">■ Estanque 3</span> &nbsp;
+        <span class="amarillo">■ Estanque 4</span> &nbsp;
+        <span class="morado">■ Estanque 5</span> &nbsp;
+        <span class="cian">■ Estanque 6</span> &nbsp;
+        <span class="rojo">— mínimo sano</span>
+      </div>
+    </div>
+
+    <p id="ayuda">
+      Arrastra para orbitar · rueda para zoom · <kbd>R</kbd> reset ·
+      <kbd>espacio</kbd> pausa · <kbd>+</kbd>/<kbd>−</kbd> velocidad.<br>
+      <b>Clic sobre un estanque</b> para ver su detalle y sus gráficas de 24 h.<br>
+      Los sensores son simulados a partir del reloj (hora + estación) y de
+      eventos. El color del agua cambia con la turbidez.
+    </p>
+  </aside>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
