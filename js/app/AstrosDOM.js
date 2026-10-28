@@ -1,10 +1,10 @@
 // ------------------------------------------------------------
 // AstrosDOM.js — Sol y Luna renderizados en Canvas 2D superpuesto
-// Proyecta la posición 3D del astro con la misma VP de la cámara
-// y dibuja discos con gradientes radiales (sin WebGL).
+// Coloca los discos en la franja de cielo visible: la altura la fija la
+// elevación real del astro (comprimida al arco que cabe en el encuadre)
+// corregida por la inclinación de la cámara; el avance este→oeste (la
+// suben y bajan según la hora simulada) recorre el ancho del canvas.
 // ------------------------------------------------------------
-
-import { multiplicarMat4, transformarPunto } from "../math/Matrix4.js";
 
 let canvas2d = null;
 let ctx = null;
@@ -30,15 +30,84 @@ export function initAstros(canvasWebGL) {
   ctx = canvas2d.getContext("2d");
 }
 
-function proyectar(posicion3d, viewMatrix, projMatrix, cw, ch) {
-  const vp  = multiplicarMat4(projMatrix, viewMatrix);
-  const ndc = transformarPunto(vp, posicion3d);
-  // Rechazar si está detrás de la cámara
-  if (ndc[2] > 1.0) return null;
-  return [
-    (ndc[0] * 0.5 + 0.5) * cw,
-    (1 - (ndc[1] * 0.5 + 0.5)) * ch
-  ];
+// La luz sale con el sol a hasta 76° de elevación; dibujado en crudo ese
+// arco cae siempre fuera del encuadre (la cámara mira hacia abajo), así que
+// se comprime a 7,5° aparentes: amanece en el horizonte y llega casi al
+// borde superior sin salirse de la franja de cielo.
+const FAC_ELEVACION = 7.5 / 76;
+// Reserva lateral para que el disco nunca quede cortado por el borde.
+const MARGEN_BORDE = 44;
+
+/**
+ * Actualiza sol y luna en canvas 2D.
+ * @param {object} opts - { viewMatrix, projMatrix, elev, dirSol, fase }
+ *   elev: seno de la elevación solar ( >0 de día ); dirSol: dirección
+ *   normalizada hacia el sol; fase: ángulo horario desde las 06:00.
+ */
+export function actualizarAstros({ viewMatrix, projMatrix, elev, dirSol, fase }) {
+  if (!ctx) return;
+  const cw = canvas2d.width;
+  const ch = canvas2d.height;
+  ctx.clearRect(0, 0, cw, ch);
+
+  // Inclinación de la cámara (positiva = hacia abajo) y tan(FOV/2 vertical)
+  const pitch = Math.asin(Math.max(-1, Math.min(1, viewMatrix[6])));
+  const tanMediaV = 1 / projMatrix[5];
+
+  // Altura en pantalla de una dirección con elevación `alfa` (rad):
+  // recorre la franja entre el horizonte encuadrado y el borde superior.
+  const yElev = (alfa) =>
+    ch * 0.5 * (1 - Math.tan(alfa * FAC_ELEVACION + pitch) / tanMediaV);
+
+  // Avance este→oeste: amanecer a la derecha, ocaso a la izquierda.
+  const f = ((fase % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  const xAvance = (t) => (cw - MARGEN_BORDE) + t * (2 * MARGEN_BORDE - cw);
+
+  const alfa = Math.atan2(dirSol[1], Math.hypot(dirSol[0], dirSol[2]));
+
+  // ---- SOL (sube desde el amanecer, se pone al ocaso) ----
+  if (elev > -0.22) {
+    const y = yElev(alfa);
+    if (y > -24 && y < ch + 24) {
+      const x = xAvance(Math.min(f, 2 * Math.PI - f) / Math.PI);
+      const t = Math.max(0, elev);
+      const alph = Math.min(1, 0.35 + t * 0.65);
+      // Colores según altura: alba/ocaso naranja, mediodía blanco
+      const cCenter = lerpColor([255, 255, 240], [255, 200, 80],  1 - t);
+      const cEdge   = lerpColor([255, 220, 180], [255, 140, 30],  1 - t);
+      const cHalo0  = lerpColorA([255, 200, 80, 0.35], [255, 230, 100, 0.22], 1 - t);
+      const cHalo1  = "rgba(255,150,30,0)";
+      const radioSol  = 22;   // píxeles en pantalla
+      dibujarDisco(x, y, radioSol, cCenter, cEdge,
+        radioSol * 3.2, [cHalo0, cHalo1], alph);
+    }
+  }
+
+  // ---- LUNA (antípoda: sube cuando el sol cae) ----
+  if (elev < 0.15) {
+    const y = yElev(-alfa);
+    if (y > -20 && y < ch + 20) {
+      const x = xAvance(Math.abs(f - Math.PI) / Math.PI);
+      const tLuna = Math.max(0, -elev);
+      const alph  = Math.min(0.92, 0.4 + tLuna * 0.55);
+      const radioLuna = 16;
+      dibujarDisco(x, y, radioLuna,
+        "rgb(240,242,255)", "rgb(180,190,220)",
+        radioLuna * 2.5, ["rgba(160,175,255,0.20)", "rgba(100,120,200,0)"], alph);
+
+      // Cráter sutil
+      ctx.save();
+      ctx.globalAlpha = alph * 0.18;
+      ctx.fillStyle   = "rgb(140,145,170)";
+      ctx.beginPath();
+      ctx.arc(x + radioLuna * 0.2, y - radioLuna * 0.15, radioLuna * 0.28, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(x - radioLuna * 0.35, y + radioLuna * 0.2, radioLuna * 0.18, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
 }
 
 function dibujarDisco(x, y, radio, colorCenter, colorEdge, haloRadio, haloColor, alpha) {
@@ -66,78 +135,6 @@ function dibujarDisco(x, y, radio, colorCenter, colorEdge, haloRadio, haloColor,
   ctx.fill();
 
   ctx.restore();
-}
-
-/**
- * Actualiza sol y luna en canvas 2D.
- * La posición del Sol usa EXACTAMENTE la misma dirección que la luz de la
- * escena (dirSol, normalizada, hacia el astro); la Luna es su antípoda,
- * por lo que está arriba del cielo cuando el Sol cae bajo el horizonte.
- * @param {object} opts - { viewMatrix, projMatrix, elev, dirSol, camObj }
- */
-export function actualizarAstros({ viewMatrix, projMatrix, elev, dirSol, camObj }) {
-  if (!ctx) return;
-  const cw = canvas2d.width;
-  const ch = canvas2d.height;
-  ctx.clearRect(0, 0, cw, ch);
-
-  const DIST = 280;
-  const obj  = camObj || [0, 1, 2];
-
-  // ---- SOL (en la dirección exacta de la luz) ----
-  const mostrarSol = elev > -0.22;
-  if (mostrarSol) {
-    const posSol = [
-      obj[0] + dirSol[0] * DIST,
-      obj[1] + dirSol[1] * DIST,
-      obj[2] + dirSol[2] * DIST
-    ];
-    const sc = proyectar(posSol, viewMatrix, projMatrix, cw, ch);
-    if (sc) {
-      const t    = Math.max(0, elev);
-      const alph = Math.min(1, 0.35 + t * 0.65);
-      // Colores según altura: alba/ocaso naranja, mediodía blanco
-      const cCenter = lerpColor([255, 255, 240], [255, 200, 80],  1 - t);
-      const cEdge   = lerpColor([255, 220, 180], [255, 140, 30],  1 - t);
-      const cHalo0  = lerpColorA([255, 200, 80, 0.35], [255, 230, 100, 0.22], 1 - t);
-      const cHalo1  = "rgba(255,150,30,0)";
-      const radioSol  = 22;   // píxeles en pantalla
-      dibujarDisco(sc[0], sc[1], radioSol, cCenter, cEdge,
-        radioSol * 3.2, [cHalo0, cHalo1], alph);
-    }
-  }
-
-  // ---- LUNA (antípoda del sol) ----
-  const mostrarLuna = elev < 0.15;
-  if (mostrarLuna) {
-    const dirLuna  = [-dirSol[0], -dirSol[1], -dirSol[2]];
-    const posLuna  = [
-      obj[0] + dirLuna[0] * DIST,
-      obj[1] + dirLuna[1] * DIST,
-      obj[2] + dirLuna[2] * DIST
-    ];
-    const lc = proyectar(posLuna, viewMatrix, projMatrix, cw, ch);
-    if (lc) {
-      const tLuna = Math.max(0, -elev);
-      const alph  = Math.min(0.92, 0.4 + tLuna * 0.55);
-      const radioLuna = 16;
-      dibujarDisco(lc[0], lc[1], radioLuna,
-        "rgb(240,242,255)", "rgb(180,190,220)",
-        radioLuna * 2.5, ["rgba(160,175,255,0.20)", "rgba(100,120,200,0)"], alph);
-
-      // Cráter sutil
-      ctx.save();
-      ctx.globalAlpha = alph * 0.18;
-      ctx.fillStyle   = "rgb(140,145,170)";
-      ctx.beginPath();
-      ctx.arc(lc[0] + radioLuna * 0.2, lc[1] - radioLuna * 0.15, radioLuna * 0.28, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(lc[0] - radioLuna * 0.35, lc[1] + radioLuna * 0.2, radioLuna * 0.18, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    }
-  }
 }
 
 // ---- helpers internos ----

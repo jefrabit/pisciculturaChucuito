@@ -51,18 +51,20 @@ const scene = new Scene();
 // 2. CÁMARA ORBITAL INTERACTIVA (Paso 15 / 16)
 // ------------------------------------------------------------
 const FOV = 55;
-const camaraDefecto = { theta: 0.5, phi: 1.0, radio: 78 };
-const camara = { ...camaraDefecto, objetivo: [4, 1, 0] };
+// phi: ángulo polar (más alto = mira más bajo). 1.30 deja el horizonte
+// dentro del encuadre, lo que hace visible la franja de cielo con sol/luna.
+const camaraDefecto = { theta: 0.5, phi: 1.30, radio: 98 };
+const camara = { ...camaraDefecto, objetivo: [42, 1, 0] };
 const camera = new PerspectiveCamera(FOV, canvas.width / canvas.height, 0.1, 600);
 
 const VISTAS = {
-  general: { objetivo: [4, 1, 0], theta: 0.5, phi: 1.0, radio: 78 },
+  general: { objetivo: [42, 1, 0], theta: 0.5, phi: 1.30, radio: 98 },
   "estanque-1": { objetivo: [-25, 2, 0], theta: 0.95, phi: 0.8, radio: 26 },
-  "estanque-2": { objetivo: [-7, 0, 0], theta: 0.25, phi: 0.8, radio: 26 },
-  "estanque-3": { objetivo: [11, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
-  "estanque-4": { objetivo: [29, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
-  "estanque-5": { objetivo: [47, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
-  "estanque-6": { objetivo: [67, 0, 0], theta: 0.15, phi: 0.7, radio: 32 },
+  "estanque-2": { objetivo: [1, 0, 0], theta: 0.25, phi: 0.8, radio: 26 },
+  "estanque-3": { objetivo: [27, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
+  "estanque-4": { objetivo: [53, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
+  "estanque-5": { objetivo: [79, 0, 0], theta: 0.15, phi: 0.7, radio: 26 },
+  "estanque-6": { objetivo: [107, 0, 0], theta: 0.15, phi: 0.7, radio: 32 },
   incubadora: { objetivo: [-10, 3, -16], theta: 0.15, phi: 0.9, radio: 20 }
 };
 
@@ -133,16 +135,18 @@ window.addEventListener("keydown", e => {
 // - Incubadora techada con interior NEGRO
 // - Engorde B OUTDOOR (sin techo)
 const Lx = 20, Lz = 8, aguaY = 1.3;
+const CALLE = 6;   // separación entre estanque y estanque (calle de 6 u)
 const LAYOUT = {
-  // Serie en cascada bajando la pendiente O→E (x: -41 → -25 → -7 → +11 → +29 → +47 → +67)
+  // Serie en cascada bajando la pendiente O→E, con calle de 6 u entre
+  // estanque y estanque (x: -41 → -25 → +1 → +27 → +53 → +79 → +107)
   toma: { cx: -41, cz: -5 },                    // compuerta en vertiente Murinlaya
   estanques: [
     { cx: -25, cz: 0, lx: 20, lz: 8,  techado: true,  nombre: "Estanque 1 · Alevinaje" },    // techado (calamina)
-    { cx:  -7, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 2 · Engorde"    },    // OUTDOOR
-    { cx:  11, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 3 · Acabado"    },    // OUTDOOR
-    { cx:  29, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 4 · Pre-descarga" },  // OUTDOOR
-    { cx:  47, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 5 · Descarga"   },    // OUTDOOR
-    { cx:  67, cz: 0, lx: 24, lz: 12, techado: false, nombre: "Estanque 6 · Embalse final" }  // más grande, cierra la cascada
+    { cx:   1, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 2 · Engorde"    },    // OUTDOOR
+    { cx:  27, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 3 · Acabado"    },    // OUTDOOR
+    { cx:  53, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 4 · Pre-descarga" },  // OUTDOOR
+    { cx:  79, cz: 0, lx: 20, lz: 8,  techado: false, nombre: "Estanque 5 · Descarga"   },    // OUTDOOR
+    { cx: 107, cz: 0, lx: 24, lz: 12, techado: false, nombre: "Estanque 6 · Embalse final" }  // más grande, cierra la cascada
   ],
   incubadora: { cx: -10, cz: -16 },             // sala techada, interior negro
   camino: { cx: 0, cz: 0, ancho: 3.2, largo: 60 },
@@ -713,7 +717,7 @@ function render(ahora) {
     projMatrix:  camera.projectionMatrix,
     elev,
     dirSol,
-    camObj:      camara.objetivo
+    fase
   });
 
   // Actualizar tinte de agua de cada estanque según su turbidez
